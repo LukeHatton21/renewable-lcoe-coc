@@ -31,6 +31,9 @@ def get_secret(key: str) -> str | None:
 SOLAR_URL = get_secret("SOLAR_URL")
 WIND_URL  = get_secret("WIND_URL")
 
+SOLAR_URL = "https://www.dropbox.com/scl/fi/rv6lbuk00yryfznkkkdwg/SOLAR_TOTAL_RESULTS.nc?rlkey=cs71w2nni36w4x5dp6srtsnv3&st=y8dew6wi&dl=0&dl=1"
+WIND_URL = "https://www.dropbox.com/scl/fi/gjf8f4iko67wvufuphptm/WIND_TOTAL_RESULTS.nc?rlkey=vjny9o28wndwit8scirkb7rme&st=6trhmznn&dl=0&dl=1"
+
 # Validate and warn
 _missing = [name for name, val in [("SOLAR_URL", SOLAR_URL), ("WIND_URL", WIND_URL)] if not val]
 
@@ -55,6 +58,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 VAR_LABELS = {
     "Calculated_LCOE": "LCOE (USD/MWh, national)",
     "Uniform_LCOE": "LCOE (USD/MWh, uniform)",
+    "CoC_LCOE": "LCOE (USD/MWh, cost of capital adjusted)",
     "Electricity_CI": "Grid carbon intensity (kgCO2/kWh)",
     "technical_potential": "Renewable technical potential (TPA)",
     "electricity_production": "Electricity production (kWH per annum per MW)",
@@ -131,6 +135,65 @@ def load_country_mapping() -> pd.DataFrame:
 
     cm = cm.dropna(subset=["country_id"]).drop_duplicates(subset=["country_id"])
     return cm
+
+@st.cache_data(show_spinner=False)
+def load_cost_of_capital(
+    risk_share: float,
+    year: int = 2025,
+    tax_year: str = "2024",
+    min_debt_share: float = 0.4,
+    max_debt_share: float = 0.8,
+) -> pd.DataFrame:
+    """risk_share is the fraction (0-1) of CDS/CRP included in CoD/CoE."""
+    fp = DATA_DIR / "solar-timeseries.csv"
+    tax_fp = DATA_DIR / "CORPORATE_TAX_DATA.csv"
+    map_fp = DATA_DIR / "country_mapping_regions.csv"
+    cols = ["Country code", "Risk_Free", "CRP", "CDS", "Lenders_Margin", "ERP", "Technology_Premium"]
+    out_cols = ["country_id"] + cols + ["CoD", "CoE", "Debt_Share", "Tax_Rate", "WACC"]
+    if not (fp.exists() and tax_fp.exists() and map_fp.exists()):
+        return pd.DataFrame(columns=out_cols)
+
+    df = pd.read_csv(fp, usecols=cols + ["Year"])
+    if year not in df["Year"].values:
+        year = int(df["Year"].max())
+    df = df.loc[df["Year"] == year, cols].drop_duplicates(subset=["Country code"]).copy()
+
+    # Missing risk premiums are filled with the second-highest value for that year
+    for col in ["CDS", "CRP"]:
+        ranked = df[col].dropna().sort_values(ascending=False)
+        if len(ranked) >= 2:
+            df[col] = df[col].fillna(ranked.iloc[1])
+
+    df["CoD"] = (
+        df["Risk_Free"]
+        + risk_share * df["CDS"]
+        + df[["Lenders_Margin", "Technology_Premium"]].max(axis=1)
+    )
+    df["CoE"] = df["Risk_Free"] + df["ERP"] + risk_share * df["CRP"] + df["Technology_Premium"]
+
+    # Debt share scales linearly from max (lowest CDS) to min (highest CDS)
+    cds = df["CDS"].fillna(0.0)
+    cds_range = cds.max() - cds.min()
+    cds_norm = (cds - cds.min()) / cds_range if cds_range > 0 else 0.0
+    df["Debt_Share"] = max_debt_share - (max_debt_share - min_debt_share) * cds_norm
+
+    # keep_default_na=False so Namibia's ISO2 code "NA" is not parsed as missing
+    tax = pd.read_csv(tax_fp, usecols=["iso_2", "Country code", tax_year], keep_default_na=False)
+    tax["Tax_Rate"] = pd.to_numeric(tax[tax_year], errors="coerce")
+    df = df.merge(tax[["Country code", "iso_2", "Tax_Rate"]], on="Country code", how="left")
+    df["Tax_Rate"] = df["Tax_Rate"].fillna(tax["Tax_Rate"].median())
+
+    df["WACC"] = (
+        df["Debt_Share"] * df["CoD"] * (1 - df["Tax_Rate"] / 100)
+        + (1 - df["Debt_Share"]) * df["CoE"]
+    )
+
+    cmap = pd.read_csv(map_fp, usecols=["index", "country"], keep_default_na=False)
+    cmap = cmap.rename(columns={"index": "country_id", "country": "iso_2"})
+    df = df.merge(cmap, on="iso_2", how="left")
+    df["country_id"] = pd.to_numeric(df["country_id"], errors="coerce").astype("Int64")
+
+    return df[out_cols].reset_index(drop=True)
 
 @st.cache_data(show_spinner=False)
 def load_cost_mapping() -> pd.DataFrame:
@@ -533,6 +596,42 @@ def change_capex_absolute_df(
     return out
 
 
+def recalculate_lcoe_with_coc(
+    df: pd.DataFrame,
+    coc: pd.DataFrame,
+    tech: str,
+    opex_assumption: float,
+    lifetime_years: int = 20,
+) -> pd.DataFrame:
+    """Recalculate LCOE at every point using the country-level WACC from load_cost_of_capital."""
+    out = df.drop(columns=["CoC_WACC", "CoC_LCOE"], errors="ignore")
+    capex_col = "wind_costs_usd_kw" if tech.lower() == "wind" else "solar_costs_usd_kw"
+    required = ["country_id", capex_col, "electricity_production"]
+    if out.empty or coc.empty or any(c not in out.columns for c in required):
+        out["CoC_WACC"] = np.nan
+        out["CoC_LCOE"] = np.nan
+        return out
+
+    out = out.merge(
+        coc[["country_id", "WACC"]].dropna(subset=["country_id"]).drop_duplicates(subset=["country_id"]).rename(columns={"WACC": "CoC_WACC"}),
+        on="country_id",
+        how="left",
+    )
+
+    capex_per_mw = pd.to_numeric(out[capex_col], errors="coerce").astype(float) * 1000.0
+    electricity_production = pd.to_numeric(out["electricity_production"], errors="coerce").astype(float)
+    annual_generation_mwh = electricity_production.where(electricity_production > 0) / 1000.0
+
+    r = out["CoC_WACC"].astype(float).clip(lower=0.0) / 100.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        crf = np.where(r > 0, r / (1 - (1 + r) ** (-lifetime_years)), 1.0 / lifetime_years)
+    crf = np.where(r.isna(), np.nan, crf)
+
+    annual_cost = capex_per_mw * (crf + float(opex_assumption) / 100.0)
+    out["CoC_LCOE"] = annual_cost / annual_generation_mwh
+    return out
+
+
 def summarize_group(df: pd.DataFrame, group_col: str, LCOE_col: str = "levelised_cost") -> pd.DataFrame:
     valid = df.dropna(subset=[group_col, LCOE_col]).copy()
     if valid.empty:
@@ -560,7 +659,8 @@ def summarize_group(df: pd.DataFrame, group_col: str, LCOE_col: str = "levelised
 with st.sidebar:
     st.header("Global Controls")
     tech = st.selectbox("Renewable Technology", ["Wind", "Solar"], index=0)
-    scenario = st.selectbox("Cost of capital scenario", ["Uniform", "National"], index=0)
+    scenario = st.selectbox("Cost of capital scenario", ["National"], index=0)
+    risk_share_pct = st.slider("Country risk premium passthrough (%)", 0, 100, 100, step=5)
     st.subheader("About")
     with st.sidebar.expander("About this app", expanded=False):
         st.sidebar.markdown(
@@ -601,11 +701,21 @@ with st.spinner("Downloading/loading underlying data..."):
 
 country_map = load_country_mapping()
 cost_mapping = load_cost_mapping()
+opex_default = 2.3 if tech == "Wind" else 2.6
 df_sf = apply_country_mapping(df_sf, country_map, cost_mapping)
-if scenario == "Uniform":
-    df_sf["Selected_LCOE"] = df_sf["Uniform_LCOE"]
-else: 
-    df_sf["Selected_LCOE"] = df_sf["Calculated_LCOE"]
+
+# Baseline Calculated_LCOE uses full (100%) country risk passthrough
+df_full = recalculate_lcoe_with_coc(df_sf, load_cost_of_capital(1.0), tech=tech, opex_assumption=opex_default)
+df_sf["Calculated_LCOE"] = df_full["CoC_LCOE"].fillna(df_sf["Calculated_LCOE"]).to_numpy()
+
+coc_df = load_cost_of_capital(risk_share_pct / 100)
+df_sf = recalculate_lcoe_with_coc(
+    df_sf,
+    coc_df,
+    tech=tech,
+    opex_assumption=opex_default,
+)
+df_sf["Selected_LCOE"] = df_sf["Calculated_LCOE"]
 
 if not df_sf.empty:
     df_sf = df_sf.dropna(subset=["Calculated_LCOE"], how="all")
@@ -631,8 +741,9 @@ with tab1:
                 VAR_LABELS["electricity_production"],
                 VAR_LABELS["technical_potential"],
                 VAR_LABELS["Electricity_CI"],
+                VAR_LABELS["CoC_LCOE"],
             ],
-            index=0,
+            index=5,
         )
         metric = LABEL_TO_VAR[metric_label]
 
@@ -653,8 +764,8 @@ with tab1:
             st.warning("No data available for this metric.")
         else:
             q_low = df_map[metric].quantile(0.02)
-            if metric == "Calculated_LCOE" or metric == "Uniform_LCOE":
-                q_hi = 150
+            if metric in ("Calculated_LCOE", "Uniform_LCOE", "CoC_LCOE"):
+                q_hi = 100
             else:
                 q_hi = df_map[metric].quantile(0.75)
             if np.isclose(q_low, q_hi):
@@ -777,7 +888,7 @@ with tab2:
                         if len(map_df) > max_region_points:
                             map_df = map_df.sample(max_region_points, random_state=42)
 
-                        q_hi = 150
+                        q_hi = 100
 
                         hover_data = {
                             "region": True,
@@ -832,8 +943,8 @@ with tab3:
     else:
         LCOE_field = st.selectbox(
             "LCOE field for summary",
-            options=[VAR_LABELS["Calculated_LCOE"], VAR_LABELS["Uniform_LCOE"]],
-            index=0,
+            options=[VAR_LABELS["Calculated_LCOE"], VAR_LABELS["Uniform_LCOE"], VAR_LABELS["CoC_LCOE"]],
+            index=2,
             key="region_LCOE_field",
         )
         LCOE_var = LABEL_TO_VAR[LCOE_field]
@@ -914,7 +1025,7 @@ with tab3:
                 x="region",
                 y="LCOE_component",
                 color="component",
-                range_y=[0, 150],
+                range_y=[0, 100],
                 barmode="stack",
                 title=f"Contributions to the {breakdown_suffix} LCOE (USD/MWh)",
                 labels={"LCOE_component": "LCOE component (USD/MWh)", "region": "Region"},
@@ -977,25 +1088,19 @@ with tab4:
                 c4.metric("LCOE 90th percentile (National)", f"{LCOE_p90:.2f}")
                 c5.metric("Maximum LCOE (National)", f"{LCOE_max:.2f}")
 
-                # ---- metrics ----
-                LCOE_min_uniform = df_country["Uniform_LCOE"].min()
-                LCOE_p10_uniform = df_country["Uniform_LCOE"].quantile(0.10)
-                LCOE_p50_uniform = df_country["Uniform_LCOE"].median()
-                LCOE_p90_uniform = df_country["Uniform_LCOE"].quantile(0.90)
-                LCOE_max_uniform = df_country["Uniform_LCOE"].max()
-
+                coc_lcoe = df_country["CoC_LCOE"]
                 c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Minimum LCOE (Uniform)", f"{LCOE_min_uniform:.2f}")
-                c2.metric("LCOE 10th percentile (Uniform)", f"{LCOE_p10_uniform:.2f}")
-                c3.metric("LCOE median (Uniform)", f"{LCOE_p50_uniform:.2f}")
-                c4.metric("LCOE 90th percentile (Uniform)", f"{LCOE_p90_uniform:.2f}")
-                c5.metric("Maximum LCOE (Uniform)", f"{LCOE_max_uniform:.2f}")
+                c1.metric("Minimum LCOE (CoC adjusted)", f"{coc_lcoe.min():.2f}")
+                c2.metric("LCOE 10th percentile (CoC adjusted)", f"{coc_lcoe.quantile(0.10):.2f}")
+                c3.metric("LCOE median (CoC adjusted)", f"{coc_lcoe.median():.2f}")
+                c4.metric("LCOE 90th percentile (CoC adjusted)", f"{coc_lcoe.quantile(0.90):.2f}")
+                c5.metric("Maximum LCOE (CoC adjusted)", f"{coc_lcoe.max():.2f}")
 
                 # ---- subset map (auto-zoom to country extent) ----
                 lat_c = float(df_country["latitude"].mean())
                 lon_c = float(df_country["longitude"].mean())
 
-                value_col = "Selected_LCOE"
+                value_col = "CoC_LCOE"
 
                 geojson_cells, df_cells = build_cell_geojson(df_country, value_col=value_col, id_col="cell_id")
 
@@ -1006,7 +1111,7 @@ with tab4:
                     lon_c = float(df_cells["longitude"].mean())
 
                     LCOE_MIN = 0.0
-                    LCOE_MAX = 150.0
+                    LCOE_MAX = 100.0
 
                     fig_cells = px.choropleth_map(
                         df_cells,
@@ -1021,7 +1126,7 @@ with tab4:
                             "longitude": ":.2f",
                             "region": True,
                             "country_name": True,
-                            "Selected_LCOE": ":.3f",
+                            "CoC_LCOE": ":.3f",
                         },
                         center={"lat": lat_c, "lon": lon_c},
                         zoom=4,
@@ -1063,19 +1168,13 @@ with tab5:
                 c4.metric("LCOE 90th percentile (National)", f"{LCOE_p90:.2f}")
                 c5.metric("Maximum LCOE (National)", f"{LCOE_max:.2f}")
 
-                # ---- metrics ----
-                LCOE_min_uniform = df_country["Uniform_LCOE"].min()
-                LCOE_p10_uniform = df_country["Uniform_LCOE"].quantile(0.10)
-                LCOE_p50_uniform = df_country["Uniform_LCOE"].median()
-                LCOE_p90_uniform = df_country["Uniform_LCOE"].quantile(0.90)
-                LCOE_max_uniform = df_country["Uniform_LCOE"].max()
-
+                coc_lcoe = df_country["CoC_LCOE"]
                 c1, c2, c3, c4, c5 = st.columns(5)
-                c1.metric("Minimum LCOE (Uniform)", f"{LCOE_min_uniform:.2f}")
-                c2.metric("LCOE 10th percentile (Uniform)", f"{LCOE_p10_uniform:.2f}")
-                c3.metric("LCOE median (Uniform)", f"{LCOE_p50_uniform:.2f}")
-                c4.metric("LCOE 90th percentile (Uniform)", f"{LCOE_p90_uniform:.2f}")
-                c5.metric("Maximum LCOE (Uniform)", f"{LCOE_max_uniform:.2f}")
+                c1.metric("Minimum LCOE (CoC adjusted)", f"{coc_lcoe.min():.2f}")
+                c2.metric("LCOE 10th percentile (CoC adjusted)", f"{coc_lcoe.quantile(0.10):.2f}")
+                c3.metric("LCOE median (CoC adjusted)", f"{coc_lcoe.median():.2f}")
+                c4.metric("LCOE 90th percentile (CoC adjusted)", f"{coc_lcoe.quantile(0.90):.2f}")
+                c5.metric("Maximum LCOE (CoC adjusted)", f"{coc_lcoe.max():.2f}")
             # ---- cumulative cost-technical potential curve ----
             curve = df_country.dropna(subset=["Calculated_LCOE", "technical_potential"]).copy()
             curve = curve[curve["technical_potential"] > 0].copy()
@@ -1089,9 +1188,9 @@ with tab5:
                 curve["Calculated_LCOE"] = pd.to_numeric(curve["Calculated_LCOE"], errors="coerce")
 
                 lcoe_series = ["Calculated_LCOE"]
-                if "Uniform_LCOE" in curve.columns:
-                    curve["Uniform_LCOE"] = pd.to_numeric(curve["Uniform_LCOE"], errors="coerce")
-                    lcoe_series.append("Uniform_LCOE")
+                if curve["CoC_LCOE"].notna().any():
+                    curve["CoC_LCOE"] = pd.to_numeric(curve["CoC_LCOE"], errors="coerce")
+                    lcoe_series.append("CoC_LCOE")
 
                 curve_long = curve.melt(
                     id_vars=["cum_potential", "cum_potential_share"],
@@ -1101,7 +1200,7 @@ with tab5:
                 )
                 curve_long["lcoe_metric"] = curve_long["lcoe_metric"].replace({
                     "Calculated_LCOE": "Calculated LCOE",
-                    "Uniform_LCOE": "Uniform LCOE",
+                    "CoC_LCOE": "CoC adjusted LCOE",
                 })
 
                 fig_curve = px.line(
